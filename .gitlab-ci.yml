@@ -1,0 +1,125 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_REF_PROTECTED
+
+image: docker:19.03.7
+services:
+  - docker:19.03.7-dind
+
+stages:
+  - build-test
+  - analyze
+  - package-test
+  - deploy-to-test
+  - notify
+
+
+variables:
+  # This will suppress any download for dependencies and plugins or upload messages which would clutter the console log.
+  # `showDateTime` will show the passed time in milliseconds. You need to specify `--batch-mode` to make this work.
+  MAVEN_OPTS: "-Dhttps.protocols=TLSv1.2 -Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN -Dorg.slf4j.simpleLogger.showDateTime=true -Djava.awt.headless=true"
+  # As of Maven 3.3.0 instead of this you may define these options in `.mvn/maven.config` so the same config is used
+  # when running from the command line.
+  # `installAtEnd` and `deployAtEnd` are only effective with recent version of the corresponding plugins.
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end --show-version -DinstallAtEnd=true -DdeployAtEnd=true"
+
+
+# To deploy packages from CI, create a ci_settings.xml file
+# For deploying packages to GitLab's Maven Repository: See https://docs.gitlab.com/ee/user/packages/maven_repository/index.html#create-maven-packages-with-gitlab-cicd for more details.
+# Please note: The GitLab Maven Repository is currently only available in GitLab Premium / Ultimate.
+# For `master` branch run `mvn deploy` automatically.
+maven-build:
+  # This template uses jdk8 for verifying and deploying images
+  image: maven:3.3.9-jdk-8
+  stage: build-test
+  cache:
+    paths:
+      - .m2/repository
+  script:
+    - if [ ! -f ci_settings.xml ];
+        then echo "CI settings missing\! If deploying to GitLab Maven Repository, please see https://docs.gitlab.com/ee/user/packages/maven_repository/index.html#create-maven-packages-with-gitlab-cicd for instructions.";
+      fi
+    - 'mvn $MAVEN_CLI_OPTS deploy -s ci_settings.xml'
+    - 'mvn package -B'
+    - if [ $? -ne 0 ]; then python send_pagerduty_trigger.py; fi
+  only:
+    variables:
+      - $CI_COMMIT_BRANCH == "dev"
+  artifacts:
+    paths:
+      - target/*.war
+
+
+sonarqube-check:
+  stage: analyze
+  image: maven:3.6.3-jdk-11
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script: 
+    - mvn verify sonar:sonar -Dsonar.projectKey=$SONAR_PROJECT_KEY
+    - if [ $? -ne 0 ]; then python send_pagerduty_trigger.py; fi
+  only:
+    - dev # or the name of your main branch
+
+
+
+docker-build:
+  stage: package-test
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  # Default branch leaves tag empty (= latest tag)
+  # All other branches are tagged with the escaped branch name (commit ref slug)
+  script:
+    - |
+      if [[ $CI_COMMIT_TAG ]]; then
+        tag=":$CI_COMMIT_TAG"
+        echo "Running on branch '$CI_COMMIT_BRANCH': tag = $tag"
+      else
+        tag=":$TAG_CI"
+        echo "Running on branch '$CI_COMMIT_BRANCH': tag = ':$TAG_CI'"
+      fi
+#    - cp env.development .env
+    - docker build --pull -t "$CI_REGISTRY/$CI_REGISTRY_IMAGE${tag}" .
+    - docker push "$CI_REGISTRY/$CI_REGISTRY_IMAGE${tag}"
+    - if [ $? -ne 0 ]; then python send_pagerduty_trigger.py; fi
+ # Run this job in a branch where a Dockerfile exists
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      exists:
+        - Dockerfile
+
+update_manifest-test:
+  stage: deploy-to-test
+  variables:
+    GIT_STRATEGY: none
+  retry: 2
+  script:
+    # Add SSH key to root
+    - mkdir -p /root/.ssh
+    - echo "$SSH_PRIVATE_KEY" > /root/.ssh/id_rsa
+    - ssh-keyscan -H gitlab.com > /root/.ssh/known_hosts
+    - chmod 600 /root/.ssh/id_rsa
+    # Git
+    - apk add --no-cache git
+    - git config --global user.name $APP_NAME
+    - git config --global user.email $APP_NAME_IMAGE"@gitlab.com"
+    - git clone --single-branch --branch main $CD_GIT_REPOSITORY
+    - cd app-chart/backend-admin-ui
+    # Helm
+    - >
+      docker run --rm -v ${PWD}:/workdir mikefarah/yq:3.2.1 yq write 
+      --inplace --verbose $CD_MANIFEST_FILE appVersion $TAG_CI
+    - cat $CD_MANIFEST_FILE
+    - git commit -am "update image tag" && git push origin main
+    - if [ $? -ne 0 ]; then python send_pagerduty_trigger.py; fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      exists:
+        - Dockerfile
